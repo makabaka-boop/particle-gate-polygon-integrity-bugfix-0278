@@ -14,6 +14,7 @@ request (nothing is partially evaluated).
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 
 MAX_POINTS = 5000
 MAX_GATES = 20
@@ -50,72 +51,142 @@ def _is_num(value):
 
 
 # ---------------------------------------------------------------------------
-# geometry helpers (tolerance-scaled exact-sign tests)
+# geometry helpers (exact-sign tests: float filter + exact rational fallback)
+#
+# Coordinates are floats, and every float is an exact rational, so the sign
+# of any cross product can be decided exactly.  Each predicate is first
+# evaluated in float64; the result is trusted only when it clears a rigorous
+# error bound, otherwise it is recomputed exactly with Fraction.  This keeps
+# the common case fast while never misclassifying thin polygons or points
+# arbitrarily close to an edge.
+
+# 32 ulps of headroom over the true float64 error bound (~7 ulps) for
+# cross = (ax-ox)*(by-oy) - (ay-oy)*(bx-ox).
+_FILTER_REL = 32.0 * 2.0**-53
 
 
-def _coord_scale(verts):
-    scale = 1.0
-    for x, y in verts:
-        scale = max(scale, abs(x), abs(y))
-    return scale
+def _cross_sign(ox, oy, ax, ay, bx, by):
+    """Exact sign of the cross product of vectors OA and OB: -1, 0 or 1."""
+    t1 = (ax - ox) * (by - oy)
+    t2 = (ay - oy) * (bx - ox)
+    cross = t1 - t2
+    bound = _FILTER_REL * (abs(t1) + abs(t2))
+    if cross > bound:
+        return 1
+    if cross < -bound:
+        return -1
+    exact = (Fraction(ax) - Fraction(ox)) * (Fraction(by) - Fraction(oy)) - (
+        Fraction(ay) - Fraction(oy)
+    ) * (Fraction(bx) - Fraction(ox))
+    if exact > 0:
+        return 1
+    if exact < 0:
+        return -1
+    return 0
 
 
-def _eps(verts):
-    """Tolerance for cross products (units of coordinate^2)."""
-    s = _coord_scale(verts)
-    return 1e-9 * s * s
+def _orient_sign(a, b, c):
+    """Exact sign of the turn from segment AB towards point C."""
+    return _cross_sign(a[0], a[1], b[0], b[1], c[0], c[1])
+
+
+def _on_segment(a, b, p):
+    """True when P lies on segment AB; P must be collinear with AB."""
+    return min(a[0], b[0]) <= p[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= p[
+        1
+    ] <= max(a[1], b[1])
+
+
+def _segments_intersect(a, b, c, d):
+    """True when segments AB and CD share any point, touching included."""
+    o1 = _orient_sign(a, b, c)
+    o2 = _orient_sign(a, b, d)
+    o3 = _orient_sign(c, d, a)
+    o4 = _orient_sign(c, d, b)
+    if o1 == 0 and _on_segment(a, b, c):
+        return True
+    if o2 == 0 and _on_segment(a, b, d):
+        return True
+    if o3 == 0 and _on_segment(c, d, a):
+        return True
+    if o4 == 0 and _on_segment(c, d, b):
+        return True
+    return o1 != o2 and o3 != o4
 
 
 def _signed_area2(verts):
-    total = 0.0
+    """Exact doubled signed area of the vertex loop (a Fraction)."""
+    total = Fraction(0)
     n = len(verts)
     for i in range(n):
         x1, y1 = verts[i]
         x2, y2 = verts[(i + 1) % n]
-        total += x1 * y2 - x2 * y1
+        total += Fraction(x1) * Fraction(y2) - Fraction(x2) * Fraction(y1)
     return total
 
 
 def _is_convex(verts):
     """All consecutive-edge cross products share one sign (zeros allowed)."""
     n = len(verts)
-    eps = _eps(verts)
     sign = 0
     for i in range(n):
-        ox, oy = verts[i]
-        ax, ay = verts[(i + 1) % n]
-        bx, by = verts[(i + 2) % n]
-        cross = (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
-        if cross > eps:
+        cross = _orient_sign(verts[i], verts[(i + 1) % n], verts[(i + 2) % n])
+        if cross > 0:
             if sign < 0:
                 return False
             sign = 1
-        elif cross < -eps:
+        elif cross < 0:
             if sign > 0:
                 return False
             sign = -1
     return True
 
 
-def point_in_convex(px, py, verts, eps):
-    """Half-plane test: inside (or on the boundary) of a convex polygon.
+def _is_simple(verts):
+    """No edge touches or crosses another edge (the loop does not self-intersect).
+
+    Consistent turn signs alone do not imply a simple polygon: with five or
+    more vertices a self-intersecting loop (e.g. a pentagram) can turn the
+    same way at every vertex, so simplicity has to be checked explicitly.
+    """
+    n = len(verts)
+    for i in range(n):
+        a, b = verts[i], verts[(i + 1) % n]
+        # Adjacent edges share only their common endpoint; collinear overlap
+        # means the loop doubles back on itself.
+        c = verts[(i + 2) % n]
+        if _orient_sign(a, b, c) == 0 and (
+            _on_segment(a, b, c) or _on_segment(b, c, a)
+        ):
+            return False
+        # Non-adjacent edges must not meet at all.
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            if _segments_intersect(a, b, verts[j], verts[(j + 1) % n]):
+                return False
+    return True
+
+
+def point_in_convex(px, py, verts):
+    """Half-plane test: inside (or on the boundary of) a convex polygon.
 
     A convex polygon is the intersection of its edge half-planes, so a point
-    is in it iff every edge cross product has a consistent sign; a zero cross
-    product means the point lies on that edge's supporting line, i.e. on the
-    boundary when the other signs agree.
+    is in it iff every edge cross product has a consistent sign; an exactly
+    zero cross product means the point lies on that edge's supporting line,
+    i.e. on the boundary when the other signs agree.
     """
     n = len(verts)
     sign = 0
     for i in range(n):
         x1, y1 = verts[i]
         x2, y2 = verts[(i + 1) % n]
-        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
-        if cross > eps:
+        cross = _cross_sign(x1, y1, x2, y2, px, py)
+        if cross > 0:
             if sign < 0:
                 return False
             sign = 1
-        elif cross < -eps:
+        elif cross < 0:
             if sign > 0:
                 return False
             sign = -1
@@ -184,7 +255,9 @@ def _validate_vertices(raw, where):
         verts.append(pt)
     if not _is_convex(verts):
         _fail(f"{where}.vertices do not form a convex polygon")
-    if abs(_signed_area2(verts)) <= _eps(verts):
+    if not _is_simple(verts):
+        _fail(f"{where}.vertices form a self-intersecting polygon")
+    if _signed_area2(verts) == 0:
         _fail(f"{where}.vertices form a polygon with zero area")
     return verts
 
@@ -283,11 +356,10 @@ def evaluate(points, gates):
     for gate in gates:
         if gate["type"] == "polygon":
             verts = gate["vertices"]
-            eps = _eps(verts)
             hits = {
                 p["id"]
                 for p in points
-                if point_in_convex(p["size"], p["intensity"], verts, eps)
+                if point_in_convex(p["size"], p["intensity"], verts)
             }
         else:
             left = gate_sets[index_by_id[gate["left"]]]

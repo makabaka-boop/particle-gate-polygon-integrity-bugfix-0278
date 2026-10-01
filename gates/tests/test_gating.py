@@ -245,6 +245,47 @@ class CrossCheckTest(unittest.TestCase):
         got = evaluate(*validate_payload({"points": [], "gates": []}))
         self.assertEqual(got, {"gates": [], "points": []})
 
+    def test_thin_polygon_with_nonzero_area_accepted(self):
+        # Height 5e-7 over a 1000-wide base: the area is tiny but non-zero,
+        # so the gate must validate and gate points exactly.
+        payload = {
+            "points": [
+                {"id": 1, "size": 500, "intensity": 0},  # on the base edge
+                {"id": 2, "size": 500, "intensity": 1},  # far above the apex
+            ],
+            "gates": [
+                {
+                    "id": "thin",
+                    "type": "polygon",
+                    "vertices": [[0, 0], [1000, 0], [500, 0.0000005]],
+                }
+            ],
+        }
+        points, gates = validate_payload(payload)
+        got = evaluate(points, gates)
+        self.assertEqual(got["gates"][0]["points"], [1])
+
+    def test_point_hugging_outside_of_edge_is_not_a_hit(self):
+        # The lower edge rises 2e-9 per unit of x, so (500, 0) sits 1e-6
+        # below it: outside, and outside must not count as a boundary hit.
+        payload = {
+            "points": [
+                {"id": 1, "size": 500, "intensity": 0},  # just outside
+                {"id": 2, "size": 1000, "intensity": 500},  # on the right edge
+                {"id": 3, "size": 999, "intensity": 1},  # interior
+            ],
+            "gates": [
+                {
+                    "id": "shallow",
+                    "type": "polygon",
+                    "vertices": [[0, 0], [1000, 0.000002], [1000, 1000]],
+                }
+            ],
+        }
+        points, gates = validate_payload(payload)
+        got = evaluate(points, gates)
+        self.assertEqual(got["gates"][0]["points"], [2, 3])
+
 
 class HttpTest(unittest.TestCase):
     def setUp(self):
@@ -386,6 +427,35 @@ class HttpTest(unittest.TestCase):
                         "id": "g",
                         "type": "polygon",
                         "vertices": [[0, 0], [10, 10], [0, 10], [10, 0]],
+                    }
+                ],
+            },
+            # Every turn goes the same way (winding number 2), so turn-sign
+            # checks alone accept this star order; it is still self-intersecting.
+            "self-intersecting star order": {
+                "points": [],
+                "gates": [
+                    {
+                        "id": "g",
+                        "type": "polygon",
+                        "vertices": [
+                            [500.0, 900.0],
+                            [264.885899, 176.393202],
+                            [880.422607, 623.606798],
+                            [119.577393, 623.606798],
+                            [735.114101, 176.393202],
+                        ],
+                    }
+                ],
+            },
+            # Collinear edges doubling back over themselves.
+            "self-overlapping collinear edges": {
+                "points": [],
+                "gates": [
+                    {
+                        "id": "g",
+                        "type": "polygon",
+                        "vertices": [[0, 0], [2, 0], [1, 0], [1, 1]],
                     }
                 ],
             },
