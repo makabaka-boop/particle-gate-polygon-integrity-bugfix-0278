@@ -14,6 +14,7 @@ request (nothing is partially evaluated).
 from __future__ import annotations
 
 import math
+import sys
 
 MAX_POINTS = 5000
 MAX_GATES = 20
@@ -22,6 +23,15 @@ MAX_VERTICES = 12
 COORD_MIN = 0
 COORD_MAX = 1000
 COMBO_OPS = ("AND", "OR", "DIFF")
+
+# Cross products scale with coordinate^2; float rounding noise is a handful
+# of ulps of that magnitude (a few times machine epsilon * s^2).  A tolerance
+# that tight rejects exactly-collinear input only when it truly is collinear,
+# while never swallowing a visibly non-zero cross product (which would accept
+# razor-thin polygons as zero area, or count points just outside an edge as
+# boundary hits).
+_EPS_ULPS = 32
+_EPS_FACTOR = _EPS_ULPS * sys.float_info.epsilon
 
 _TOP_KEYS = {"points", "gates"}
 _POINT_KEYS = {"id", "size", "intensity"}
@@ -61,9 +71,17 @@ def _coord_scale(verts):
 
 
 def _eps(verts):
-    """Tolerance for cross products (units of coordinate^2)."""
+    """Float-rounding tolerance for cross products (units of coordinate^2).
+
+    A cross product of coordinates of magnitude s carries only a few ulps of
+    rounding error (~ a few * 2**-53 * s**2), so any cross product larger
+    than that is a genuine sign decision, not noise.  A tolerance orders of
+    magnitude looser (e.g. 1e-9 * s**2) would misclassify non-degenerate thin
+    polygons as zero area and absorb points slightly outside an edge as
+    boundary hits.
+    """
     s = _coord_scale(verts)
-    return 1e-9 * s * s
+    return _EPS_FACTOR * s * s
 
 
 def _signed_area2(verts):
@@ -76,24 +94,41 @@ def _signed_area2(verts):
     return total
 
 
-def _is_convex(verts):
-    """All consecutive-edge cross products share one sign (zeros allowed)."""
-    n = len(verts)
-    eps = _eps(verts)
-    sign = 0
-    for i in range(n):
-        ox, oy = verts[i]
-        ax, ay = verts[(i + 1) % n]
-        bx, by = verts[(i + 2) % n]
-        cross = (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+def _half_plane_signs(x1, y1, x2, y2, points, eps):
+    """Whether points fall on the positive and/or negative side of a line.
+
+    Returns (has_positive, has_negative); cross products within eps count as
+    zero (on the supporting line).
+    """
+    has_pos = has_neg = False
+    for px, py in points:
+        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
         if cross > eps:
-            if sign < 0:
-                return False
-            sign = 1
+            has_pos = True
         elif cross < -eps:
-            if sign > 0:
-                return False
-            sign = -1
+            has_neg = True
+        if has_pos and has_neg:
+            break
+    return has_pos, has_neg
+
+
+def _is_convex(verts):
+    """Every polygon edge leaves all vertices in one closed half-plane.
+
+    Checking that consecutive turns share a sign is not enough: a
+    self-intersecting winding (e.g. a five-pointed star) turns the same way at
+    every vertex.  For a genuinely convex polygon each edge's supporting line
+    is itself a separating line, so no vertex may lie strictly on the
+    opposite side.
+    """
+    eps = _eps(verts)
+    n = len(verts)
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        has_pos, has_neg = _half_plane_signs(x1, y1, x2, y2, verts, eps)
+        if has_pos and has_neg:
+            return False
     return True
 
 

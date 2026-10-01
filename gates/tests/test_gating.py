@@ -7,6 +7,7 @@ plain Python set algebra computed directly from the reference geometry.
 Randomized small payloads are compared field by field ("对拍").
 """
 
+import math
 import random
 import sys
 import unittest
@@ -15,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import create_app  # noqa: E402
-from gating import evaluate, validate_payload  # noqa: E402
+from gating import ValidationError, evaluate, validate_payload  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -23,13 +24,15 @@ from gating import evaluate, validate_payload  # noqa: E402
 
 
 def _ref_on_segment(px, py, ax, ay, bx, by):
+    scale = max(1.0, abs(ax), abs(ay), abs(bx), abs(by))
+    cross_tol = 32 * sys.float_info.epsilon * scale * scale
     cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
-    tol = 1e-9 * max(1.0, abs(ax), abs(ay), abs(bx), abs(by)) ** 2
-    if abs(cross) > tol:
+    if abs(cross) > cross_tol:
         return False
+    slack = sys.float_info.epsilon * scale
     return (
-        min(ax, bx) - 1e-9 <= px <= max(ax, bx) + 1e-9
-        and min(ay, by) - 1e-9 <= py <= max(ay, by) + 1e-9
+        min(ax, bx) - slack <= px <= max(ax, bx) + slack
+        and min(ay, by) - slack <= py <= max(ay, by) + slack
     )
 
 
@@ -244,6 +247,61 @@ class CrossCheckTest(unittest.TestCase):
     def test_empty_inputs(self):
         got = evaluate(*validate_payload({"points": [], "gates": []}))
         self.assertEqual(got, {"gates": [], "points": []})
+
+    def test_self_intersecting_star_is_rejected(self):
+        # A five-pointed star turns the same way at every vertex, so the
+        # consecutive-turn sign test accepts it; it is self-intersecting and
+        # must be rejected like any other non-convex polygon.
+        star = []
+        for k in range(5):
+            angle = math.pi / 2 + k * 4 * math.pi / 5
+            star.append(
+                [round(500 + 400 * math.cos(angle), 6),
+                 round(500 + 400 * math.sin(angle), 6)]
+            )
+        payload = {
+            "points": [{"id": 1, "size": 500, "intensity": 500}],
+            "gates": [{"id": "star", "type": "polygon", "vertices": star}],
+        }
+        with self.assertRaises(ValidationError):
+            validate_payload(payload)
+
+    def test_thin_convex_polygon_has_nonzero_area(self):
+        # area = width * thickness / 2 ~= 5e-4, while float rounding noise in
+        # the shoelace sum is ~1e-12 here; this is a real, non-degenerate gate.
+        thin = [[0.0, 0.0], [1000.0, 0.0], [1000.0, 2e-7], [0.0, 2e-7]]
+        payload = {
+            "points": [
+                {"id": 1, "size": 500, "intensity": 1},   # well outside
+                {"id": 2, "size": 500, "intensity": 0},   # on the bottom edge
+            ],
+            "gates": [{"id": "thin", "type": "polygon", "vertices": thin}],
+        }
+        points, gates = validate_payload(payload)
+        got = evaluate(points, gates)
+        self.assertEqual(got["gates"][0]["points"], [2])
+
+    def test_point_just_outside_edge_is_not_a_hit(self):
+        # Bottom edge runs from (0.999, 0) to (999.999, 0.001); the integer
+        # point (1, 0) sits ~1e-9 outside it.  Under a cross-product tolerance
+        # of 1e-9 * s**2 it was absorbed as a boundary hit.
+        verts = [
+            [0.999, 0.0], [999.999, 0.001],
+            [999.999, 10.001], [0.999, 10.0],
+        ]
+        payload = {
+            "points": [
+                {"id": 1, "size": 1, "intensity": 0},      # just outside
+                {"id": 2, "size": 500, "intensity": 5},    # well inside
+            ],
+            "gates": [{"id": "g", "type": "polygon", "vertices": verts}],
+        }
+        points, gates = validate_payload(payload)
+        got = evaluate(points, gates)
+        self.assertEqual(got["gates"][0]["points"], [2])
+        hits = {p["id"]: p["hits"] for p in got["points"]}
+        self.assertEqual(hits[1], [0])
+        self.assertEqual(hits[2], [1])
 
 
 class HttpTest(unittest.TestCase):
